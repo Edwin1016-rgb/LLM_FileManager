@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  traefik:
+    image: traefik:v2.11
+    command:
+      - --api.insecure=true           # Desactivar en producción
+      - --providers.docker
+      - --entrypoints.web.address=:80
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  api:
+    build: ./api
+    environment:
+      - RABBIT_URL=amqp://guest:guest@rabbitmq:5672/
+      - REDIS_HOST=redis
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=PathPrefix(`/api`)"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "15672:15672"   # UI de gestión opcional
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
