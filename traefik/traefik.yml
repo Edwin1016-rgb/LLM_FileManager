@@ -1,0 +1,7 @@
+api:
+  dashboard: true
+providers:
+  docker: {}
+entryPoints:
+  web:
+    address: ":80"
