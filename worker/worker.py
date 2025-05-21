@@ -1,6 +1,7 @@
-import os, json, time, pathlib, shlex, logging, traceback, uuid
-import pika, redis, openai
+import os, json, time, pathlib, shlex, logging, traceback, uuid, re
+import pika, redis, requests
 from pydantic import BaseModel, Field, ValidationError
+import ast
 
 # ───────────────────────── Configuración ────────────────────────────
 RABBIT_URL  = os.getenv("RABBIT_URL",  "amqp://guest:guest@rabbitmq:5672/")
@@ -8,11 +9,9 @@ REDIS_HOST  = os.getenv("REDIS_HOST",  "redis")
 REDIS_PORT  = int(os.getenv("REDIS_PORT", 6379))
 QUEUE       = os.getenv("QUEUE", "tasks_queue")
 BASE_DIR    = pathlib.Path(os.getenv("BASE_DIR", "/data")).resolve()
-MODEL_NAME  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-# —————— Aquí cargamos clave y endpoint de OpenRouter ——————
-openai.api_key  = os.getenv("OPENAI_API_KEY")
-openai.base_url = os.getenv("OPENAI_API_BASE", openai.base_url)
+MODEL_NAME  = os.getenv("OPENAI_MODEL", "deepseek/deepseek-r1-zero:free")
+API_KEY     = os.getenv("OPENAI_API_KEY")
+API_BASE="https://openrouter.ai/api/v1"
 
 redis_cli = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
@@ -21,9 +20,9 @@ logging.basicConfig(level=logging.INFO,
 
 # ────────────────────────── Esquemas ────────────────────────────────
 class ParsedCommand(BaseModel):
-    action: str               # ls | mv | rm
-    pattern: str              # glob (*.pdf) o nombre
-    destination: str | None = None   # solo para mv
+    action: str
+    pattern: str
+    destination: str | None = None
 
 # ─────────────── Utilidades de seguridad de ruta ────────────────────
 def resolve_path(pattern: str) -> list[pathlib.Path]:
@@ -39,38 +38,115 @@ def safe_dest_path(dest: str) -> pathlib.Path:
     return d
 
 # ─────────────── Paso 1: llamar al modelo LLM ───────────────────────
-SYSTEM_PROMPT = """
-Convierte la instrucción del usuario sobre archivos en un JSON con los
-campos: action (ls|mv|rm), pattern (glob relativo) y destination (solo si action=mv).
-Ejemplos:
-- "lista mis pdf": {"action":"ls","pattern":"**/*.pdf"}
-- "borra los .tmp": {"action":"rm","pattern":"**/*.tmp"}
-- "mueve todos los pdf de redes a revisados": {"action":"mv","pattern":"redes/**/*.pdf","destination":"revisados/"}
-Responde SOLO el JSON, sin texto extra.
+SYSTEM_PROMPT ="""
+Eres un asistente que SOLO responde con JSON VÁLIDO. 
+
+FORMATO REQUERIDO:
+```json
+{
+  "action": "ls|mv|rm",
+  "pattern": "patrón_glob",
+  "destination": "solo_para_mv" 
+}
+INSTRUCCIONES ABSOLUTAS:
+
+NUNCA incluyas texto fuera del JSON
+
+NO uses markdown (```json)
+
+Los valores DEBEN ser strings con comillas dobles
+
+Si hay error: {"action":"error","pattern":"descripción"}
+
+EJEMPLO PARA 'mueve PDFs de redes a revisados':
+
+json
+{"action":"mv","pattern":"redes/**/*.pdf","destination":"revisados"}
+RESPONDERÁS ÚNICAMENTE CON EL JSON VÁLIDO, SIN EXCEPCIONES.
 """
 
 def interpret(nl_query: str) -> ParsedCommand:
-    # debug
-    logging.debug("🔑 API_KEY present? %s", bool(openai.api_key))
-    logging.debug("🌐 API_BASE = %s", openai.base_url)
-    logging.debug("🤖 MODEL = %s", MODEL_NAME)
-
-    resp = openai.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
+    logging.info(f"🔍 Procesando consulta: '{nl_query}'")
+    
+    url = f"{API_BASE}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "File Manager Assistant",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": nl_query}
         ],
-        temperature=0.2,
-        response_format="json"       # ← fuerza respuesta JSON
-    )
-    content = resp.choices[0].message.content.strip()
-    logging.debug("LLM raw → %s", content)
+        "temperature": 0.1,
+        "max_tokens": 200
+    }
+
     try:
-        data = json.loads(content)
-        return ParsedCommand(**data)
-    except (json.JSONDecodeError, ValidationError) as e:
-        raise RuntimeError(f"Respuesta LLM inválida: {e}")
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        # Registrar la respuesta completa para verificar la estructura
+        logging.debug(f"📨 Respuesta completa: {json.dumps(data, indent=2)}")
+        
+        # Extraemos el contenido de la respuesta
+        content = None
+        
+        # Intentamos primero con la estructura estándar de OpenAI
+        if "choices" in data and len(data["choices"]) > 0:
+            if "message" in data["choices"][0] and "content" in data["choices"][0]["message"]:
+                content = data["choices"][0]["message"]["content"]
+        
+        # Si no encontramos contenido en la estructura de OpenAI, intentamos con Fireworks/OpenRouter
+        if not content and "choices" in data and len(data["choices"]) > 0:
+            if "text" in data["choices"][0]:
+                content = data["choices"][0]["text"]
+        
+        # Si aún no encontramos contenido, buscar en otros campos posibles
+        if not content:
+            for key in ["reasoning", "data", "output", "response"]:
+                if key in data:
+                    content = data[key]
+                    break
+        
+        if not content:
+            raise RuntimeError("No se encontró contenido en choices[0].message.content ni en choices[0].text ni en otros campos posibles.")
+        
+        # Limpieza del contenido para eliminar cualquier envoltorio LaTeX (por ejemplo, \boxed{})
+        cleaned_content = content.strip()
+        
+        # Eliminar cualquier texto LaTeX como \boxed{}
+        cleaned_content = re.sub(r'\\boxed{(.*)}', r'\1', cleaned_content)
+
+        # Eliminar cualquier bloque de código Markdown (```json {...}`)
+        cleaned_content = re.sub(r'```json(.*?)```', r'\1', cleaned_content, flags=re.DOTALL)
+
+        # Verifica si después de la limpieza, el contenido está vacío
+        if not cleaned_content:
+            raise RuntimeError("El contenido está vacío después de limpieza")
+        
+        logging.debug(f"🧹 Contenido limpio: {cleaned_content}")
+        
+        # Parseo final
+        try:
+            parsed_data = json.loads(cleaned_content)
+            return ParsedCommand(**parsed_data)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"JSON inválido extraído: {cleaned_content}. Error: {str(e)}")
+        except ValidationError as e:
+            raise RuntimeError(f"Validación fallida para: {parsed_data}. Error: {str(e)}")
+            
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Error de conexión: {str(e)}")
+    except Exception as e:
+        logging.error(f"Error completo: {traceback.format_exc()}")
+        raise RuntimeError(f"Error procesando la respuesta: {str(e)}")
+
 
 # ─────────────── Paso 2: ejecutar la acción ─────────────────────────
 def execute(cmd: ParsedCommand) -> dict:
@@ -142,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
